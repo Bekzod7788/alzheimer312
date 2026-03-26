@@ -1,0 +1,7 @@
+streamlit
+torch
+torchvision
+pandas
+pillow
+reportlab
+"@ | SEet-Content -Path ".\reqiirements.txt" -Encoding UTF8

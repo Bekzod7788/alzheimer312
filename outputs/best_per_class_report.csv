@@ -1,0 +1,5 @@
+﻿class,support,precision,recall,f1
+Mild Impairment,175,0.95,0.9771,0.9634
+Moderate Impairment,12,1.0,1.0,1.0
+No Impairment,640,0.9517,0.9844,0.9677
+Very Mild Impairment,448,0.9786,0.9196,0.9482

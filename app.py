@@ -1,0 +1,1104 @@
+import json
+import time
+from io import BytesIO
+from collections import Counter
+from datetime import datetime
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple
+
+import pandas as pd
+import streamlit as st
+import torch
+import torch.nn as nn
+from PIL import Image, ImageOps, UnidentifiedImageError
+from torchvision import models, transforms
+
+try:
+    from reportlab.lib import colors
+    from reportlab.lib.pagesizes import A4
+    from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+    from reportlab.lib.units import mm
+    from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle
+    REPORTLAB_AVAILABLE = True
+except Exception:
+    REPORTLAB_AVAILABLE = False
+
+
+# =========================================================
+# CONFIG
+# =========================================================
+APP_TITLE = "Alzheimer MRI Classifier Pro"
+APP_SUBTITLE = "Advanced 4-class MRI screening dashboard with analytics, reports and developer information"
+MODEL_PATH = Path("models/model_resnet18_4class.pth")
+OUTPUTS_DIR = Path("outputs")
+SUPPORTED_EXTENSIONS = ["jpg", "jpeg", "png"]
+
+DEFAULT_IMAGE_SIZE = 224
+DEFAULT_MEAN = [0.485, 0.456, 0.406]
+DEFAULT_STD = [0.229, 0.224, 0.225]
+
+OLD_TO_NEW_CLASS_NAMES = {
+    "NonDemented": "NoImpairment",
+    "VeryMildDemented": "VeryMildImpairment",
+    "MildDemented": "MildImpairment",
+    "ModerateDemented": "ModerateImpairment",
+}
+
+SHORT_LABELS = {
+    "NoImpairment": "No Imp.",
+    "VeryMildImpairment": "Very Mild",
+    "MildImpairment": "Mild",
+    "ModerateImpairment": "Moderate",
+    "No Impairment": "No Imp.",
+    "Very Mild Impairment": "Very Mild",
+    "Mild Impairment": "Mild",
+    "Moderate Impairment": "Moderate",
+}
+
+RISK_LABELS = {
+    "NoImpairment": "Low concern",
+    "VeryMildImpairment": "Borderline concern",
+    "MildImpairment": "Moderate concern",
+    "ModerateImpairment": "High concern",
+}
+
+CLASS_DESCRIPTIONS = {
+    "NoImpairment": "Tasvir model tomonidan normal yoki past xavfli holatga yaqin deb baholandi.",
+    "VeryMildImpairment": "Tasvir juda erta yoki chegaraviy kognitiv o‘zgarish ehtimolini ko‘rsatishi mumkin.",
+    "MildImpairment": "Tasvir model bo‘yicha yengil darajadagi buzilish bilan mos keluvchi belgilarni ko‘rsatdi.",
+    "ModerateImpairment": "Tasvir model bo‘yicha ancha yaqqol ifodalangan buzilish ehtimolini ko‘rsatdi.",
+}
+
+DEVELOPER_NAME = "Kuyliyev Bekzod Bobonazarovich"
+DEVELOPER_ROLE = "AI/ML loyiha ishlab chiquvchisi"
+
+st.set_page_config(
+    page_title=APP_TITLE,
+    page_icon="🧠",
+    layout="wide",
+    initial_sidebar_state="expanded",
+)
+
+
+# =========================================================
+# SESSION STATE
+# =========================================================
+if "history" not in st.session_state:
+    st.session_state.history = []
+
+if "last_batch_results" not in st.session_state:
+    st.session_state.last_batch_results = []
+
+
+# =========================================================
+# STYLES
+# =========================================================
+st.markdown(
+    """
+    <style>
+    .block-container {
+        padding-top: 1.1rem;
+        padding-bottom: 2rem;
+        max-width: 1380px;
+    }
+    .hero {
+        background: linear-gradient(135deg, #0f172a 0%, #111827 45%, #1d4ed8 100%);
+        border-radius: 24px;
+        padding: 1.3rem 1.4rem;
+        border: 1px solid rgba(255,255,255,0.08);
+        margin-bottom: 1rem;
+        box-shadow: 0 10px 30px rgba(0,0,0,0.2);
+    }
+    .hero-title {
+        font-size: 2.1rem;
+        font-weight: 800;
+        margin-bottom: 0.15rem;
+    }
+    .hero-subtitle {
+        color: #dbeafe;
+        font-size: 1rem;
+        margin-bottom: 0.5rem;
+    }
+    .hero-text {
+        color: #cbd5e1;
+        font-size: 0.95rem;
+        line-height: 1.55;
+    }
+    .card {
+        background: rgba(17,24,39,0.82);
+        border: 1px solid rgba(255,255,255,0.08);
+        border-radius: 20px;
+        padding: 1rem 1.05rem;
+        margin-bottom: 0.9rem;
+        box-shadow: 0 6px 18px rgba(0,0,0,0.12);
+    }
+    .section-title {
+        font-size: 1.05rem;
+        font-weight: 700;
+        margin-bottom: 0.45rem;
+    }
+    .status-pill {
+        display: inline-block;
+        padding: 0.28rem 0.7rem;
+        border-radius: 999px;
+        font-size: 0.83rem;
+        font-weight: 700;
+        margin-top: 0.25rem;
+        border: 1px solid rgba(255,255,255,0.08);
+    }
+    .pill-low { background: rgba(22,163,74,0.18); color: #86efac; }
+    .pill-mid { background: rgba(245,158,11,0.18); color: #fde68a; }
+    .pill-high { background: rgba(239,68,68,0.18); color: #fecaca; }
+    .footer-note {
+        color: #94a3b8;
+        font-size: 0.88rem;
+        margin-top: 1rem;
+    }
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
+
+
+# =========================================================
+# HELPERS
+# =========================================================
+def normalize_class_name(name: str) -> str:
+    return OLD_TO_NEW_CLASS_NAMES.get(name, name)
+
+
+def get_short_label(name: str) -> str:
+    return SHORT_LABELS.get(name, name)
+
+
+def get_risk_label(class_name: str) -> str:
+    return RISK_LABELS.get(class_name, "Review needed")
+
+
+def get_risk_pill_class(class_name: str) -> str:
+    if class_name == "NoImpairment":
+        return "pill-low"
+    if class_name in {"VeryMildImpairment", "MildImpairment"}:
+        return "pill-mid"
+    return "pill-high"
+
+
+def build_model(num_classes: int):
+    model = models.resnet18(weights=None)
+    model.fc = nn.Linear(model.fc.in_features, num_classes)
+    return model
+
+
+def load_optional_csv(path: Path) -> Optional[pd.DataFrame]:
+    if path.exists():
+        try:
+            return pd.read_csv(path)
+        except Exception:
+            return None
+    return None
+
+
+def load_optional_json(path: Path) -> Optional[Any]:
+    if path.exists():
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception:
+            return None
+    return None
+
+
+@st.cache_resource
+def load_bundle_cached(model_path_str: str, model_mtime: float):
+    model_path = Path(model_path_str)
+
+    if not model_path.exists():
+        return None, None, None, None, f"Model fayli topilmadi: {model_path}"
+
+    try:
+        bundle = torch.load(model_path, map_location="cpu")
+    except Exception as e:
+        return None, None, None, None, f"Model faylini o‘qishda xato: {e}"
+
+    if not isinstance(bundle, dict):
+        return None, None, None, None, "Model formati noto‘g‘ri: dict emas."
+
+    if "model_state" not in bundle or "class_to_idx" not in bundle:
+        return None, None, None, None, "Model ichida 'model_state' yoki 'class_to_idx' topilmadi."
+
+    class_to_idx = bundle["class_to_idx"]
+    if not isinstance(class_to_idx, dict) or not class_to_idx:
+        return None, None, None, None, "class_to_idx noto‘g‘ri yoki bo‘sh."
+
+    try:
+        idx_to_class = {int(v): normalize_class_name(str(k)) for k, v in class_to_idx.items()}
+    except Exception:
+        return None, None, None, None, "class_to_idx formatida xato bor."
+
+    sorted_indices = sorted(idx_to_class.keys())
+    expected_indices = list(range(len(idx_to_class)))
+    if sorted_indices != expected_indices:
+        return None, None, None, None, "class_to_idx indekslari ketma-ket emas."
+
+    image_size = int(bundle.get("image_size", DEFAULT_IMAGE_SIZE))
+    mean = bundle.get("mean", DEFAULT_MEAN)
+    std = bundle.get("std", DEFAULT_STD)
+
+    model = build_model(num_classes=len(idx_to_class))
+    try:
+        model.load_state_dict(bundle["model_state"], strict=True)
+    except Exception as e:
+        return None, None, None, None, f"State dict yuklashda xato: {e}"
+
+    model.eval()
+
+    meta = {
+        "classes": [idx_to_class[i] for i in sorted(idx_to_class)],
+        "num_classes": len(idx_to_class),
+        "image_size": image_size,
+        "normalize_mean": mean,
+        "normalize_std": std,
+        "device": "CPU",
+        "best_epoch": bundle.get("best_epoch"),
+        "best_test_acc": bundle.get("best_test_acc"),
+    }
+
+    return model, idx_to_class, image_size, meta, None
+
+
+def get_transform(image_size: int, mean: List[float], std: List[float]):
+    return transforms.Compose([
+        transforms.Resize((image_size, image_size)),
+        transforms.ToTensor(),
+        transforms.Normalize(mean=mean, std=std),
+    ])
+
+
+def open_uploaded_image(uploaded_file):
+    try:
+        img = Image.open(uploaded_file)
+        img = ImageOps.exif_transpose(img).convert("RGB")
+        return img, None
+    except UnidentifiedImageError:
+        return None, f"Rasm formatini o‘qib bo‘lmadi: {uploaded_file.name}"
+    except Exception as e:
+        return None, f"Rasmni ochishda xato ({uploaded_file.name}): {e}"
+
+
+def predict_single_image(model, idx_to_class, image, image_size, mean, std):
+    tfm = get_transform(image_size, mean, std)
+    x = tfm(image).unsqueeze(0)
+
+    t0 = time.perf_counter()
+    with torch.no_grad():
+        logits = model(x)
+        probs = torch.softmax(logits, dim=1)[0].cpu()
+    dt = time.perf_counter() - t0
+
+    pred_idx = int(torch.argmax(probs).item())
+    pred_name = idx_to_class[pred_idx]
+
+    rows = []
+    for i in range(len(probs)):
+        rows.append({
+            "Class": idx_to_class[i],
+            "Probability": float(probs[i].item()),
+            "ShortClass": get_short_label(idx_to_class[i]),
+        })
+
+    prob_df = pd.DataFrame(rows).sort_values("Probability", ascending=False).reset_index(drop=True)
+
+    result = {
+        "predicted_class": pred_name,
+        "confidence": float(probs[pred_idx].item()),
+        "inference_time_sec": float(dt),
+        "probabilities": {row["Class"]: row["Probability"] for _, row in prob_df.iterrows()},
+        "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+    }
+    return result, prob_df
+
+
+def get_borderline_flag(prob_df: pd.DataFrame) -> Optional[str]:
+    if len(prob_df) < 2:
+        return None
+
+    c1 = prob_df.loc[0, "Class"]
+    c2 = prob_df.loc[1, "Class"]
+    p1 = float(prob_df.loc[0, "Probability"])
+    p2 = float(prob_df.loc[1, "Probability"])
+
+    if {c1, c2} == {"NoImpairment", "VeryMildImpairment"} and abs(p1 - p2) < 0.12:
+        return (
+            "Natija NoImpairment va VeryMildImpairment oralig‘ida noaniq. "
+            "Bu borderline holat bo‘lishi mumkin."
+        )
+    return None
+
+
+def build_single_report(case_id, age, sex, notes, filename, result):
+    payload = {
+        "timestamp": result["timestamp"],
+        "source_file": filename,
+        "case_id": case_id or "N/A",
+        "age": age,
+        "sex": sex,
+        "prediction": result["predicted_class"],
+        "risk_label": get_risk_label(result["predicted_class"]),
+        "confidence": round(result["confidence"], 6),
+        "inference_time_sec": round(result["inference_time_sec"], 6),
+        "notes": notes,
+        "probabilities": result["probabilities"],
+    }
+    return json.dumps(payload, indent=2, ensure_ascii=False)
+
+
+def add_to_history(source_file, case_id, age, sex, notes, result):
+    st.session_state.history.append({
+        "timestamp": result["timestamp"],
+        "source_file": source_file,
+        "case_id": case_id or "N/A",
+        "age": age,
+        "sex": sex,
+        "prediction": result["predicted_class"],
+        "risk_label": get_risk_label(result["predicted_class"]),
+        "confidence": round(result["confidence"], 4),
+        "inference_time_sec": round(result["inference_time_sec"], 4),
+        "notes": notes,
+    })
+
+
+def build_ai_text_summary(result: Dict[str, Any], prob_df: pd.DataFrame, borderline_msg: Optional[str], case_id: str, age: int, sex: str, notes: str) -> str:
+    predicted = result["predicted_class"]
+    confidence = result["confidence"]
+    risk = get_risk_label(predicted)
+    description = CLASS_DESCRIPTIONS.get(predicted, "Tasvir model bo‘yicha baholandi.")
+
+    lines = []
+    lines.append(f"AI screening xulosasi: eng ehtimoliy natija — {predicted}.")
+    lines.append(f"Ishonchlilik darajasi: {confidence:.2%}. Risk talqini: {risk}.")
+    lines.append(description)
+
+    if borderline_msg:
+        lines.append(borderline_msg)
+
+    top_rows = prob_df.head(2)
+    if len(top_rows) == 2:
+        c1 = top_rows.loc[0, 'Class']
+        p1 = top_rows.loc[0, 'Probability']
+        c2 = top_rows.loc[1, 'Class']
+        p2 = top_rows.loc[1, 'Probability']
+        lines.append(
+            f"Eng yuqori ikki ehtimol: {c1} ({p1:.2%}) va {c2} ({p2:.2%})."
+        )
+
+    if case_id or notes or sex != "Unknown":
+        lines.append(
+            f"Klinik kontekst: Case ID={case_id or 'N/A'}, yosh={age}, jins={sex}, izoh={notes or 'yo‘q'}."
+        )
+
+    lines.append(
+        "Mazkur natija sun’iy intellekt asosidagi skrining xulosasi bo‘lib, yakuniy tibbiy tashxis hisoblanmaydi."
+    )
+    lines.append(
+        "Natijani klinik simptomlar, anamnez va mutaxassis ko‘rigi bilan birga baholash tavsiya etiladi."
+    )
+    return " ".join(lines)
+
+
+def create_pdf_report(
+    result: Dict[str, Any],
+    prob_df: pd.DataFrame,
+    borderline_msg: Optional[str],
+    source_file: str,
+    case_id: str,
+    age: int,
+    sex: str,
+    notes: str,
+) -> bytes:
+    if not REPORTLAB_AVAILABLE:
+        raise RuntimeError("PDF yaratish uchun reportlab o‘rnatilmagan.")
+
+    buffer = BytesIO()
+    doc = SimpleDocTemplate(
+        buffer,
+        pagesize=A4,
+        rightMargin=18 * mm,
+        leftMargin=18 * mm,
+        topMargin=16 * mm,
+        bottomMargin=16 * mm,
+    )
+
+    styles = getSampleStyleSheet()
+    title_style = ParagraphStyle(
+        "TitleCustom",
+        parent=styles["Title"],
+        fontSize=18,
+        leading=22,
+        textColor=colors.HexColor("#0F172A"),
+        spaceAfter=8,
+    )
+    sub_style = ParagraphStyle(
+        "SubCustom",
+        parent=styles["BodyText"],
+        fontSize=10,
+        leading=14,
+        textColor=colors.HexColor("#334155"),
+        spaceAfter=6,
+    )
+    section_style = ParagraphStyle(
+        "SectionCustom",
+        parent=styles["Heading2"],
+        fontSize=12,
+        leading=16,
+        textColor=colors.HexColor("#1D4ED8"),
+        spaceBefore=8,
+        spaceAfter=6,
+    )
+    body_style = ParagraphStyle(
+        "BodyCustom",
+        parent=styles["BodyText"],
+        fontSize=10,
+        leading=14,
+        textColor=colors.HexColor("#111827"),
+    )
+
+    story = []
+    story.append(Paragraph("Alzheimer MRI AI Screening Report", title_style))
+    story.append(Paragraph(APP_SUBTITLE, sub_style))
+    story.append(Spacer(1, 4))
+
+    overview_data = [
+        ["Case ID", case_id or "N/A", "Date/Time", result["timestamp"]],
+        ["Source file", source_file, "Developer", DEVELOPER_NAME],
+        ["Prediction", result["predicted_class"], "Risk label", get_risk_label(result["predicted_class"])],
+        ["Confidence", f"{result['confidence']:.2%}", "Inference time", f"{result['inference_time_sec']:.4f} s"],
+        ["Age", str(age), "Sex", sex],
+    ]
+    overview_table = Table(overview_data, colWidths=[28 * mm, 58 * mm, 30 * mm, 56 * mm])
+    overview_table.setStyle(TableStyle([
+        ("BACKGROUND", (0, 0), (-1, 0), colors.whitesmoke),
+        ("BACKGROUND", (0, 0), (0, -1), colors.HexColor("#EFF6FF")),
+        ("BACKGROUND", (2, 0), (2, -1), colors.HexColor("#EFF6FF")),
+        ("BOX", (0, 0), (-1, -1), 0.6, colors.HexColor("#CBD5E1")),
+        ("INNERGRID", (0, 0), (-1, -1), 0.4, colors.HexColor("#CBD5E1")),
+        ("FONTNAME", (0, 0), (-1, -1), "Helvetica"),
+        ("FONTSIZE", (0, 0), (-1, -1), 9),
+        ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+        ("LEFTPADDING", (0, 0), (-1, -1), 6),
+        ("RIGHTPADDING", (0, 0), (-1, -1), 6),
+        ("TOPPADDING", (0, 0), (-1, -1), 6),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 6),
+    ]))
+    story.append(overview_table)
+    story.append(Spacer(1, 8))
+
+    story.append(Paragraph("AI Written Summary", section_style))
+    ai_text = build_ai_text_summary(result, prob_df, borderline_msg, case_id, age, sex, notes)
+    story.append(Paragraph(ai_text, body_style))
+
+    if notes:
+        story.append(Spacer(1, 6))
+        story.append(Paragraph("User Notes", section_style))
+        story.append(Paragraph(notes, body_style))
+
+    story.append(Spacer(1, 8))
+    story.append(Paragraph("Probability Breakdown", section_style))
+    prob_table_data = [["Class", "Probability"]]
+    for _, row in prob_df.iterrows():
+        prob_table_data.append([str(row["Class"]), f"{float(row['Probability']):.2%}"])
+
+    prob_table = Table(prob_table_data, colWidths=[90 * mm, 35 * mm])
+    prob_table.setStyle(TableStyle([
+        ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#1D4ED8")),
+        ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
+        ("BOX", (0, 0), (-1, -1), 0.6, colors.HexColor("#CBD5E1")),
+        ("INNERGRID", (0, 0), (-1, -1), 0.4, colors.HexColor("#CBD5E1")),
+        ("FONTNAME", (0, 0), (-1, -1), "Helvetica"),
+        ("FONTSIZE", (0, 0), (-1, -1), 9),
+        ("LEFTPADDING", (0, 0), (-1, -1), 6),
+        ("RIGHTPADDING", (0, 0), (-1, -1), 6),
+        ("TOPPADDING", (0, 0), (-1, -1), 6),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 6),
+    ]))
+    story.append(prob_table)
+
+    if borderline_msg:
+        story.append(Spacer(1, 8))
+        story.append(Paragraph("Borderline Warning", section_style))
+        story.append(Paragraph(borderline_msg, body_style))
+
+    story.append(Spacer(1, 10))
+    story.append(Paragraph("Medical Disclaimer", section_style))
+    story.append(Paragraph(
+        "Mazkur hisobot sun’iy intellekt asosidagi skrining natijasidir va yakuniy tibbiy tashxis o‘rnini bosmaydi. "
+        "Natijani malakali mutaxassis ko‘rigi, klinik simptomlar, anamnez va radiologik baholash bilan birgalikda ko‘rib chiqish zarur.",
+        body_style,
+    ))
+
+    doc.build(story)
+    pdf_value = buffer.getvalue()
+    buffer.close()
+    return pdf_value
+
+
+# =========================================================
+# LOAD MODEL + OPTIONAL FILES
+# =========================================================
+model_mtime = MODEL_PATH.stat().st_mtime if MODEL_PATH.exists() else 0.0
+model, idx_to_class, image_size, model_meta, load_error = load_bundle_cached(str(MODEL_PATH), model_mtime)
+
+if model_meta is None:
+    model_meta = {
+        "classes": [],
+        "num_classes": 0,
+        "image_size": DEFAULT_IMAGE_SIZE,
+        "normalize_mean": DEFAULT_MEAN,
+        "normalize_std": DEFAULT_STD,
+        "device": "CPU",
+        "best_epoch": None,
+        "best_test_acc": None,
+    }
+
+per_class_df = load_optional_csv(OUTPUTS_DIR / "best_per_class_report.csv")
+confusion_df = load_optional_csv(OUTPUTS_DIR / "best_confusion_matrix.csv")
+train_history = load_optional_json(OUTPUTS_DIR / "train_history.json")
+
+
+# =========================================================
+# SIDEBAR
+# =========================================================
+with st.sidebar:
+    st.title("⚙️ Control Center")
+
+    if load_error:
+        st.error(load_error)
+    else:
+        st.success("Model muvaffaqiyatli yuklandi")
+
+        s1, s2 = st.columns(2)
+        with s1:
+            st.metric("Model", "ResNet18")
+            st.metric("Classes", model_meta["num_classes"])
+        with s2:
+            best_acc = model_meta.get("best_test_acc")
+            st.metric("Input", f'{model_meta["image_size"]}x{model_meta["image_size"]}')
+            st.metric("Best acc", f"{best_acc:.2%}" if isinstance(best_acc, (int, float)) else "N/A")
+
+        with st.expander("Model details", expanded=False):
+            st.write("Classes:", model_meta["classes"])
+            st.write("Device:", model_meta["device"])
+            st.write("Best epoch:", model_meta.get("best_epoch"))
+            st.write("Mean:", model_meta.get("normalize_mean"))
+            st.write("Std:", model_meta.get("normalize_std"))
+
+    st.markdown("### Display")
+    confidence_threshold = st.slider("Confidence threshold", 0.0, 1.0, 0.60, 0.01)
+    show_prob_table = st.checkbox("Probability jadvalini ko‘rsatish", value=True)
+    show_debug = st.checkbox("Debug ma'lumotlari", value=False)
+
+    st.markdown("### Session")
+    st.caption(f"History items: {len(st.session_state.history)}")
+    st.caption(f"Batch rows: {len(st.session_state.last_batch_results)}")
+
+    st.markdown("### Eslatma")
+    st.info("Bu demo klinik tashxis o‘rnini bosmaydi.")
+    if not REPORTLAB_AVAILABLE:
+        st.caption("PDF report ishlashi uchun reportlab o‘rnatilishi kerak: python -m pip install reportlab")
+
+
+# =========================================================
+# HERO
+# =========================================================
+st.markdown(
+    f"""
+    <div class="hero">
+        <div class="hero-title">🧠 {APP_TITLE}</div>
+        <div class="hero-subtitle">{APP_SUBTITLE}</div>
+        <div class="hero-text">
+            MRI tasvirlarni 4 klassga ajratish uchun yaratilgan kengaytirilgan dashboard.
+            Single prediction, batch workflow, session history, eksport, analytics,
+            training natijalari ko‘rish, per-class performance va borderline warning
+            funksiyalari bilan boyitilgan. Ilova foydalanuvchiga natijani yanada
+            tushunarli va aniq ko‘rsatish uchun ishlab chiqilgan.
+        </div>
+    </div>
+    """,
+    unsafe_allow_html=True,
+)
+
+if load_error:
+    st.stop()
+
+
+top1, top2, top3, top4 = st.columns(4)
+with top1:
+    st.metric("Model", "ResNet18")
+with top2:
+    st.metric("Classes", model_meta["num_classes"])
+with top3:
+    st.metric("Input size", f'{model_meta["image_size"]}x{model_meta["image_size"]}')
+with top4:
+    best_acc = model_meta.get("best_test_acc")
+    st.metric("Best test acc", f"{best_acc:.2%}" if isinstance(best_acc, (int, float)) else "N/A")
+with st.expander("Ishlab chiquvchi haqida", expanded=False):
+    st.write(f"**Ism:** {DEVELOPER_NAME}")
+    st.write(f"**Lavozim:** {DEVELOPER_ROLE}")
+    st.write("Ushbu loyiha MRI tasvirlardan foydalangan holda Alzheimer bilan bog‘liq 4 klassli screening prototipi sifatida ishlab chiqilgan.")
+
+
+# =========================================================
+# TABS
+# =========================================================
+tab_pred, tab_batch, tab_analytics, tab_history, tab_system = st.tabs([
+    "Prediction",
+    "Batch",
+    "Analytics",
+    "History & Export",
+    "System",
+])
+
+
+# =========================================================
+# PREDICTION TAB
+# =========================================================
+with tab_pred:
+    left, right = st.columns([1.05, 1])
+
+    with left:
+        st.markdown('<div class="card">', unsafe_allow_html=True)
+        st.markdown('<div class="section-title">Upload MRI Image</div>', unsafe_allow_html=True)
+
+        uploaded = st.file_uploader(
+            "MRI rasm yuklang",
+            type=SUPPORTED_EXTENSIONS,
+            key="single_uploader",
+        )
+
+        image = None
+        image_error = None
+        if uploaded is not None:
+            image, image_error = open_uploaded_image(uploaded)
+            if image_error:
+                st.error(image_error)
+            else:
+                st.image(image, caption=f"Yuklangan rasm: {uploaded.name}", use_container_width=True)
+        else:
+            st.info("Boshlash uchun MRI tasvir yuklang.")
+
+        st.markdown("</div>", unsafe_allow_html=True)
+
+    with right:
+        st.markdown('<div class="card">', unsafe_allow_html=True)
+        st.markdown('<div class="section-title">Case Information</div>', unsafe_allow_html=True)
+
+        case_id = st.text_input("Case ID", placeholder="CASE-001")
+        age = st.number_input("Yosh", min_value=1, max_value=120, value=65)
+        sex = st.selectbox("Jins", ["Unknown", "Male", "Female"])
+        notes = st.text_area("Izoh", placeholder="Qo‘shimcha ma'lumot yoki klinik eslatma...")
+
+        run_btn = st.button("🔍 Tahlilni boshlash", use_container_width=True, type="primary")
+        st.markdown("</div>", unsafe_allow_html=True)
+
+    if run_btn:
+        if uploaded is None:
+            st.warning("Avval rasm yuklang.")
+        elif image_error:
+            st.error(image_error)
+        else:
+            try:
+                result, prob_df = predict_single_image(
+                    model=model,
+                    idx_to_class=idx_to_class,
+                    image=image,
+                    image_size=model_meta["image_size"],
+                    mean=model_meta["normalize_mean"],
+                    std=model_meta["normalize_std"],
+                )
+
+                st.markdown('<div class="card">', unsafe_allow_html=True)
+                st.markdown('<div class="section-title">Prediction Result</div>', unsafe_allow_html=True)
+
+                rc1, rc2, rc3 = st.columns(3)
+                with rc1:
+                    st.metric("Predicted class", result["predicted_class"])
+                with rc2:
+                    st.metric("Confidence", f'{result["confidence"]:.2%}')
+                with rc3:
+                    st.metric("Inference time", f'{result["inference_time_sec"]:.4f} s')
+
+                pill_class = get_risk_pill_class(result["predicted_class"])
+                risk_label = get_risk_label(result["predicted_class"])
+                st.markdown(
+                    f'<span class="status-pill {pill_class}">{risk_label}</span>',
+                    unsafe_allow_html=True,
+                )
+
+                if result["confidence"] >= confidence_threshold:
+                    st.warning("Natija ko‘rib chiqilishi tavsiya etiladi.")
+                else:
+                    st.success("Natija nisbatan past noaniqlik bilan qaytdi.")
+
+                borderline_msg = get_borderline_flag(prob_df)
+                if borderline_msg:
+                    st.warning(borderline_msg)
+
+                st.markdown("### Ehtimollar taqsimoti")
+                chart_df = prob_df[["ShortClass", "Probability"]].set_index("ShortClass")
+                st.bar_chart(chart_df)
+
+                if show_prob_table:
+                    st.dataframe(prob_df[["Class", "Probability"]], use_container_width=True)
+
+                add_to_history(
+                    source_file=uploaded.name,
+                    case_id=case_id,
+                    age=age,
+                    sex=sex,
+                    notes=notes,
+                    result=result,
+                )
+
+                report_json = build_single_report(
+                    case_id=case_id,
+                    age=age,
+                    sex=sex,
+                    notes=notes,
+                    filename=uploaded.name,
+                    result=result,
+                )
+
+                st.download_button(
+                    "⬇️ JSON report yuklab olish",
+                    data=report_json,
+                    file_name=f"{Path(uploaded.name).stem}_prediction.json",
+                    mime="application/json",
+                    use_container_width=True,
+                )
+
+                if REPORTLAB_AVAILABLE:
+                    pdf_bytes = create_pdf_report(
+                        result=result,
+                        prob_df=prob_df,
+                        borderline_msg=borderline_msg,
+                        source_file=uploaded.name,
+                        case_id=case_id,
+                        age=age,
+                        sex=sex,
+                        notes=notes,
+                    )
+                    st.download_button(
+                        "⬇️ PDF report yuklab olish",
+                        data=pdf_bytes,
+                        file_name=f"{Path(uploaded.name).stem}_report.pdf",
+                        mime="application/pdf",
+                        use_container_width=True,
+                    )
+                else:
+                    st.info("PDF report uchun reportlab kutubxonasi kerak: python -m pip install reportlab")
+
+                ai_summary = build_ai_text_summary(
+                    result=result,
+                    prob_df=prob_df,
+                    borderline_msg=borderline_msg,
+                    case_id=case_id,
+                    age=age,
+                    sex=sex,
+                    notes=notes,
+                )
+                with st.expander("AI yozma xulosa", expanded=True):
+                    st.write(ai_summary)
+
+                if show_debug:
+                    with st.expander("Debug", expanded=False):
+                        st.json(result)
+
+                st.markdown("</div>", unsafe_allow_html=True)
+
+            except Exception as e:
+                st.error(f"Prediction paytida xato: {e}")
+
+
+# =========================================================
+# BATCH TAB
+# =========================================================
+with tab_batch:
+    st.markdown('<div class="card">', unsafe_allow_html=True)
+    st.markdown('<div class="section-title">Batch Prediction Workflow</div>', unsafe_allow_html=True)
+    st.caption("Bir nechta MRI rasmni bir yo‘la tahlil qiling.")
+
+    batch_files = st.file_uploader(
+        "Bir nechta rasm yuklang",
+        type=SUPPORTED_EXTENSIONS,
+        accept_multiple_files=True,
+        key="batch_uploader",
+    )
+    batch_case_prefix = st.text_input("Batch case prefix", value="BATCH")
+    batch_run = st.button("📦 Batch tahlilni boshlash", use_container_width=True)
+    st.markdown("</div>", unsafe_allow_html=True)
+
+    if batch_run:
+        if not batch_files:
+            st.warning("Avval batch fayllarni yuklang.")
+        else:
+            results = []
+            errors = []
+            progress = st.progress(0)
+            total = len(batch_files)
+
+            for idx, file in enumerate(batch_files, start=1):
+                image, err = open_uploaded_image(file)
+
+                if err:
+                    errors.append({"file": file.name, "error": err})
+                else:
+                    try:
+                        result, prob_df = predict_single_image(
+                            model=model,
+                            idx_to_class=idx_to_class,
+                            image=image,
+                            image_size=model_meta["image_size"],
+                            mean=model_meta["normalize_mean"],
+                            std=model_meta["normalize_std"],
+                        )
+                        borderline_msg = get_borderline_flag(prob_df)
+
+                        row = {
+                            "timestamp": result["timestamp"],
+                            "source_file": file.name,
+                            "case_id": f"{batch_case_prefix}-{idx:03d}",
+                            "prediction": result["predicted_class"],
+                            "risk_label": get_risk_label(result["predicted_class"]),
+                            "confidence": round(result["confidence"], 4),
+                            "inference_time_sec": round(result["inference_time_sec"], 4),
+                            "borderline": borderline_msg or "",
+                        }
+                        results.append(row)
+
+                        st.session_state.history.append({
+                            **row,
+                            "age": "",
+                            "sex": "",
+                            "notes": "batch prediction",
+                        })
+                    except Exception as e:
+                        errors.append({"file": file.name, "error": str(e)})
+
+                progress.progress(idx / total)
+
+            st.session_state.last_batch_results = results
+
+            if results:
+                df = pd.DataFrame(results).sort_values(by=["confidence", "prediction"], ascending=[False, True])
+                st.success(f"{len(results)} ta fayl tahlil qilindi.")
+                st.dataframe(df, use_container_width=True)
+
+                class_counts = Counter(df["prediction"].tolist())
+                count_df = pd.DataFrame({
+                    "Class": list(class_counts.keys()),
+                    "Count": list(class_counts.values()),
+                }).sort_values("Count", ascending=False)
+                count_df["ShortClass"] = count_df["Class"].map(get_short_label)
+
+                st.markdown("### Klasslar bo‘yicha taqsimot")
+                st.bar_chart(count_df.set_index("ShortClass")["Count"])
+
+                st.download_button(
+                    "⬇️ Batch CSV yuklab olish",
+                    data=df.to_csv(index=False),
+                    file_name="batch_predictions.csv",
+                    mime="text/csv",
+                    use_container_width=True,
+                )
+                st.download_button(
+                    "⬇️ Batch JSON yuklab olish",
+                    data=json.dumps(results, indent=2, ensure_ascii=False),
+                    file_name="batch_predictions.json",
+                    mime="application/json",
+                    use_container_width=True,
+                )
+
+            if errors:
+                st.error(f"{len(errors)} ta faylda xato yuz berdi.")
+                st.dataframe(pd.DataFrame(errors), use_container_width=True)
+
+
+# =========================================================
+# ANALYTICS TAB
+# =========================================================
+with tab_analytics:
+    left, right = st.columns([1.05, 1])
+
+    with left:
+        st.markdown('<div class="card">', unsafe_allow_html=True)
+        st.markdown('<div class="section-title">Per-class performance</div>', unsafe_allow_html=True)
+
+        if per_class_df is not None and not per_class_df.empty:
+            st.dataframe(per_class_df, use_container_width=True)
+
+            if "class" in per_class_df.columns and "recall" in per_class_df.columns:
+                chart_df = per_class_df.copy()
+                chart_df["ShortClass"] = chart_df["class"].map(get_short_label)
+                st.bar_chart(chart_df.set_index("ShortClass")["recall"])
+        else:
+            st.info("best_per_class_report.csv topilmadi yoki o‘qilmadi.")
+
+        st.markdown("</div>", unsafe_allow_html=True)
+
+        st.markdown('<div class="card">', unsafe_allow_html=True)
+        st.markdown('<div class="section-title">Training history</div>', unsafe_allow_html=True)
+
+        if isinstance(train_history, list) and train_history:
+            hist_df = pd.DataFrame(train_history)
+            st.dataframe(hist_df, use_container_width=True)
+
+            if all(c in hist_df.columns for c in ["epoch", "train_acc", "test_acc"]):
+                st.line_chart(hist_df[["epoch", "train_acc", "test_acc"]].set_index("epoch"))
+        else:
+            st.info("train_history.json topilmadi yoki o‘qilmadi.")
+
+        st.markdown("</div>", unsafe_allow_html=True)
+
+    with right:
+        st.markdown('<div class="card">', unsafe_allow_html=True)
+        st.markdown('<div class="section-title">Confusion matrix</div>', unsafe_allow_html=True)
+
+        if confusion_df is not None and not confusion_df.empty:
+            st.dataframe(confusion_df, use_container_width=True)
+        else:
+            st.info("best_confusion_matrix.csv topilmadi yoki o‘qilmadi.")
+
+        st.markdown("</div>", unsafe_allow_html=True)
+
+        st.markdown('<div class="card">', unsafe_allow_html=True)
+        st.markdown('<div class="section-title">Model diagnostics</div>', unsafe_allow_html=True)
+
+        with st.expander("Open diagnostics", expanded=False):
+            st.json({
+                "classes": model_meta.get("classes"),
+                "image_size": model_meta.get("image_size"),
+                "mean": model_meta.get("normalize_mean"),
+                "std": model_meta.get("normalize_std"),
+                "best_epoch": model_meta.get("best_epoch"),
+                "best_test_acc": model_meta.get("best_test_acc"),
+            })
+
+        st.markdown("</div>", unsafe_allow_html=True)
+
+
+# =========================================================
+# HISTORY TAB
+# =========================================================
+with tab_history:
+    st.markdown('<div class="card">', unsafe_allow_html=True)
+    st.markdown('<div class="section-title">Session History & Export</div>', unsafe_allow_html=True)
+
+    if st.session_state.history:
+        hist_df = pd.DataFrame(st.session_state.history)
+
+        h1, h2 = st.columns(2)
+        with h1:
+            selected_prediction = st.multiselect(
+                "Prediction filter",
+                options=sorted(hist_df["prediction"].astype(str).unique().tolist()),
+                default=sorted(hist_df["prediction"].astype(str).unique().tolist()),
+            )
+        with h2:
+            min_conf = st.slider("Minimum confidence", 0.0, 1.0, 0.0, 0.01, key="history_conf")
+
+        filtered_df = hist_df.copy()
+        if selected_prediction:
+            filtered_df = filtered_df[filtered_df["prediction"].isin(selected_prediction)]
+        filtered_df = filtered_df[filtered_df["confidence"] >= min_conf]
+
+        st.dataframe(filtered_df, use_container_width=True)
+
+        st.download_button(
+            "⬇️ History CSV yuklab olish",
+            data=filtered_df.to_csv(index=False),
+            file_name="prediction_history.csv",
+            mime="text/csv",
+            use_container_width=True,
+        )
+        st.download_button(
+            "⬇️ History JSON yuklab olish",
+            data=json.dumps(filtered_df.to_dict(orient="records"), indent=2, ensure_ascii=False),
+            file_name="prediction_history.json",
+            mime="application/json",
+            use_container_width=True,
+        )
+
+        if st.button("🗑️ History ni tozalash", use_container_width=True):
+            st.session_state.history = []
+            st.session_state.last_batch_results = []
+            st.rerun()
+    else:
+        st.info("Hozircha history bo‘sh.")
+
+    st.markdown("</div>", unsafe_allow_html=True)
+
+
+# =========================================================
+# SYSTEM TAB
+# =========================================================
+with tab_system:
+    c1, c2 = st.columns(2)
+
+    with c1:
+        st.markdown('<div class="card">', unsafe_allow_html=True)
+        st.markdown('<div class="section-title">Project overview</div>', unsafe_allow_html=True)
+        st.write(
+            f"""
+            Ushbu ilova premium ko‘rinishdagi MRI screening dashboard bo‘lib,
+            single prediction, batch workflow, analytics, history va eksport funksiyalarini bir joyga jamlaydi.
+
+            Ilova foydalanuvchiga quyidagi ma'lumotlarni aniqroq ko‘rsatishga mo‘ljallangan:
+            - MRI tasvirdan 4 klass bo‘yicha prediksiya
+            - confidence darajasi
+            - borderline/noaniq holatni ogohlantirish
+            - training natijalari va model tahlili
+            - seans davomida yig‘ilgan natijalarni eksport qilish
+
+            **Ishlab chiquvchi:** {DEVELOPER_NAME}
+            **Rol:** {DEVELOPER_ROLE}
+            """
+        )
+        st.markdown("</div>", unsafe_allow_html=True)
+
+        st.markdown('<div class="card">', unsafe_allow_html=True)
+        st.markdown('<div class="section-title">Key capabilities</div>', unsafe_allow_html=True)
+        st.write(
+            """
+            - Single image prediction
+            - Batch prediction
+            - Borderline detection
+            - Per-class analytics
+            - Confusion matrix viewer
+            - Session history and export
+            - Model diagnostics
+            - Prediction risk label
+            - Training history visualization
+            - Developer and system information page
+            - PDF report generation
+            - AI yozma xulosa
+            """
+        )
+        st.markdown("</div>", unsafe_allow_html=True)
+
+    with c2:
+        st.markdown('<div class="card">', unsafe_allow_html=True)
+        st.markdown('<div class="section-title">Technical metadata</div>', unsafe_allow_html=True)
+        with st.expander("Open metadata", expanded=False):
+            st.json(model_meta)
+        st.markdown("</div>", unsafe_allow_html=True)
+
+        st.markdown('<div class="card">', unsafe_allow_html=True)
+        st.markdown('<div class="section-title">Medical disclaimer</div>', unsafe_allow_html=True)
+        st.warning("Bu tizim klinik tashxis o‘rnini bosmaydi. U AI-assisted screening prototipi sifatida ishlatilishi kerak. Yakuniy tibbiy xulosa malakali mutaxassis tomonidan berilishi lozim.")
+        st.info(f"Ishlab chiquvchi: {DEVELOPER_NAME}")
+        st.markdown("</div>", unsafe_allow_html=True)
+
+
+st.markdown(
+    '<div class="footer-note">Built for local Streamlit usage with ResNet18 checkpoint support. PDF report and AI summary enabled. Developer: Kuyliyev Bekzod Bobonazarovich.</div>',
+    unsafe_allow_html=True,
+)

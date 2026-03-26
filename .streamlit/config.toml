@@ -1,0 +1,15 @@
+New-Item -ItemType Directory -Path ".\.streamlit" -Force | Out-Null
+
+@"
+[theme]
+base = "dark"
+primaryColor = "#1d4ed8"
+backgroundColor = "#0f172a"
+secondaryBackgroundColor = "#111827"
+textColor = "#f8fafc"
+
+[server]
+headless = true
+enableCORS = false
+enableXsrfProtection = false
+"@ | Set-Content -Path ".\.streamlit\config.toml" -Encoding UTF8
