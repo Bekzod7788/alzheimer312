@@ -1,8 +1,6 @@
-@"
 streamlit==1.33.0
 torch==2.2.2
 torchvision==0.17.2
 pandas==2.2.2
 pillow==10.3.0
 reportlab==4.1.0
-"@ | Set-Content -Path ".\requirements.txt" -Encoding UTF8
