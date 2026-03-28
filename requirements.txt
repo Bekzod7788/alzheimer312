@@ -1,6 +1,6 @@
-streamlit==1.33.0
-torch
-torchvision
-pandas==2.2.2
-pillow==10.3.0
-reportlab==4.1.0
+streamlit
+torch --index-url https://download.pytorch.org/whl/cpu
+torchvision --index-url https://download.pytorch.org/whl/cpu
+pandas
+pillow
+reportlab
